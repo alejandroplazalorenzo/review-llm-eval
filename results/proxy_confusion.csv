@@ -1,0 +1,5 @@
+model,proxy,positive,neutral,negative,mixed
+qwen2.5:7b-instruct,negative,0,0,132,8
+qwen2.5:7b-instruct,positive,102,0,5,33
+gemma3:4b,negative,0,0,138,2
+gemma3:4b,positive,113,2,10,15

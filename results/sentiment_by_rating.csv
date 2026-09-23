@@ -1,0 +1,11 @@
+model,stars,n,positive,neutral,negative,mixed
+qwen2.5:7b-instruct,1,70,0,0,69,1
+qwen2.5:7b-instruct,2,70,0,0,63,7
+qwen2.5:7b-instruct,3,70,2,1,40,27
+qwen2.5:7b-instruct,4,70,33,0,5,32
+qwen2.5:7b-instruct,5,70,69,0,0,1
+gemma3:4b,1,70,0,0,70,0
+gemma3:4b,2,70,0,0,68,2
+gemma3:4b,3,70,4,3,48,15
+gemma3:4b,4,70,44,1,10,15
+gemma3:4b,5,70,69,1,0,0

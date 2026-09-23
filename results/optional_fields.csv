@@ -1,0 +1,3 @@
+model,runs_compared,n,optional_valid_rate,complaint_key_present,would_return_key_present,optional_variant_complaint_non_null,required_variant_complaint_non_null,optional_variant_would_return_non_null,required_variant_would_return_non_null,sentiment_same_as_required_variant,most_common_key_order,most_common_key_order_share
+qwen2.5:7b-instruct,main vs optional,50,1.0000,1.0000,1.0000,0.7400,0.7400,0.8600,0.7400,0.9800,aspects > sentiment > complaint > would_return,1.0000
+gemma3:4b,main vs optional,50,1.0000,1.0000,1.0000,0.7400,0.7400,0.9800,0.9600,0.9600,aspects > sentiment > complaint > would_return,1.0000
