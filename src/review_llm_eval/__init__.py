@@ -1,3 +1,4 @@
-"""Classify Spanish hotel reviews with a local LLM and measure how reliable the output is."""
+"""Review enrichment with a local LLM plus a sentiment layer, re-measured on public
+Spanish hotel reviews."""
 
-__version__ = "0.1.0"
+__version__ = "0.2.0"

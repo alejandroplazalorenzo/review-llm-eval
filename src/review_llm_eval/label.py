@@ -3,8 +3,8 @@
 Usage: python -m review_llm_eval.label --labeller <your name>
 
 The labeller never sees the star rating, the hotel or any model output (blind
-labelling), so the gold labels cannot be anchored on the things they will judge.
-Progress is saved after every review; run the command again to continue.
+labelling). Progress is saved after every review; run the command again to continue.
+Labels must come from a person: a model cannot tell how often a model is wrong.
 """
 
 from __future__ import annotations
@@ -17,21 +17,27 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, TypeVar
 
-from review_llm_eval.config import ASPECTS, GOLD_PATH, GOLD_TARGET, SAMPLE_PATH, SEED
+from review_llm_eval.config import GOLD_PATH, GOLD_TARGET, SAMPLE_PATH, SEED
+from review_llm_eval.contract import CONTRACT_VERSION, INCIDENTS, TOPICS
 from review_llm_eval.data import Review, gold_queue
 from review_llm_eval.jsonl import append_jsonl, iter_jsonl, read_jsonl
-from review_llm_eval.schema import SCHEMA_VERSION
 
-SENTIMENT_KEYS = {"p": "positive", "n": "negative", "m": "mixed", "u": "neutral"}
-ASPECT_SIGNS = {"+": "positive", "-": "negative", "~": "mixed", "=": "neutral"}
-ASPECT_BY_NUMBER = {str(i): aspect for i, aspect in enumerate(ASPECTS, start=1)}
+SENTIMENT_KEYS = {"p": "POS", "n": "NEG", "u": "NEU"}
+POLARITY_SIGNS = {"+": "positive", "-": "negative", "=": "neutral"}
+ALERT_CODES = {
+    "nov": "says_no_return",
+    "leg": "legal_action",
+    "rob": "theft",
+    "enf": "illness",
+    "fra": "bad_faith",
+}
 
 T = TypeVar("T")
 
 HELP = (
-    "Aspects: type number+sign, separated by spaces. Signs: + positive, - negative, "
-    "~ mixed, = neutral. Example: '1+ 4- 5~'. Empty line = no aspect mentioned.\n"
-    + "  ".join(f"{n}={a}" for n, a in ASPECT_BY_NUMBER.items())
+    "Opinions: topic code + sign, separated by spaces (+ positive, - negative, = neutral).\n"
+    "Example: 'hab- atn+ buf='. Empty line = no opinion.\n"
+    + "  ".join(f"{code}={long}" for code, (long, _) in TOPICS.items())
 )
 
 
@@ -42,53 +48,59 @@ class Quit(Exception):
 def parse_sentiment(text: str) -> str:
     key = text.strip().lower()
     if key not in SENTIMENT_KEYS:
-        raise ValueError("type p, n, m or u")
+        raise ValueError("type p, n or u")
     return SENTIMENT_KEYS[key]
 
 
-def parse_aspects(text: str) -> dict[str, str]:
-    """Parse ``'1+ 4- 5~'`` (or ``'staff+ food-'``) into {aspect: sentiment}."""
-    labels: dict[str, str] = {}
+def parse_opinions(text: str) -> list[dict[str, str]]:
+    """``'hab- atn+'`` -> [{topic: room, polarity: negative}, {topic: staff_service, ...}]."""
+    out: list[dict[str, str]] = []
     for token in text.replace(",", " ").split():
-        sign = token[-1]
-        name = token[:-1].strip().lower()
-        if sign not in ASPECT_SIGNS or not name:
-            raise ValueError(f"'{token}': expected number or name followed by + - ~ =")
-        aspect = ASPECT_BY_NUMBER.get(name, name)
-        if aspect not in ASPECTS:
-            raise ValueError(f"'{token}': unknown aspect")
-        if aspect in labels:
-            raise ValueError(f"'{token}': aspect given twice")
-        labels[aspect] = ASPECT_SIGNS[sign]
-    return labels
+        sign, code = token[-1], token[:-1].strip().lower()
+        if sign not in POLARITY_SIGNS or code not in TOPICS:
+            raise ValueError(f"'{token}': expected a topic code followed by + - =")
+        pair = {"topic": TOPICS[code][0], "polarity": POLARITY_SIGNS[sign]}
+        if pair in out:
+            raise ValueError(f"'{token}': given twice")
+        out.append(pair)
+    return out
 
 
-def parse_would_return(text: str) -> bool | None:
+def parse_staff(text: str) -> list[str]:
+    return [" ".join(n.split()) for n in text.split(",") if n.strip()]
+
+
+def parse_incident(text: str) -> str | None:
+    code = text.strip().lower() or "none"
+    if code not in INCIDENTS:
+        raise ValueError(f"type one of: {', '.join(INCIDENTS)} (empty = none)")
+    return INCIDENTS[code][0]
+
+
+def parse_alerts(text: str) -> list[str]:
+    codes = text.replace(",", " ").split()
+    unknown = [c for c in codes if c not in ALERT_CODES]
+    if unknown:
+        raise ValueError(f"unknown alert code(s): {', '.join(unknown)}")
+    return sorted({ALERT_CODES[c] for c in codes})
+
+
+def parse_yes_no(text: str) -> bool:
     key = text.strip().lower()
-    if key in ("", "-"):
-        return None
     if key in ("y", "s"):
         return True
-    if key == "n":
+    if key in ("n", ""):
         return False
-    raise ValueError("type y, n or leave empty if not stated")
+    raise ValueError("type y or n (empty = n)")
 
 
-def gold_record(
-    review_id: int,
-    sentiment: str,
-    aspects: dict[str, str],
-    would_return: bool | None,
-    labeller: str,
-) -> dict[str, Any]:
+def gold_record(review_id: int, labeller: str, **labels: Any) -> dict[str, Any]:
     return {
         "review_id": review_id,
-        "sentiment": sentiment,
-        "aspects": {a: aspects[a] for a in ASPECTS if a in aspects},
-        "would_return": would_return,
+        **labels,
         "labeller": labeller,
         "labelled_at": datetime.now(UTC).isoformat(timespec="seconds"),
-        "schema_version": SCHEMA_VERSION,
+        "contract_version": CONTRACT_VERSION,
     }
 
 
@@ -129,23 +141,46 @@ def label_loop(
         print_fn("-" * 78)
         try:
             sentiment = ask(
-                "Overall [p]ositive [n]egative [m]ixed ne[u]tral (q quits): ",
+                "Overall [p]ositive [n]egative ne[u]tral (q quits): ",
                 parse_sentiment,
                 input_fn,
                 print_fn,
             )
             print_fn(HELP)
-            aspects = ask("Aspects: ", parse_aspects, input_fn, print_fn)
-            would_return = ask(
-                "Would return? [y]es [n]o, empty = not stated: ",
-                parse_would_return,
+            opinions = ask("Opinions: ", parse_opinions, input_fn, print_fn)
+            staff = ask(
+                "Staff names written in the review (comma separated): ",
+                parse_staff,
                 input_fn,
                 print_fn,
             )
+            incident = ask(
+                f"Incident ({'/'.join(INCIDENTS)}, empty = none): ",
+                parse_incident,
+                input_fn,
+                print_fn,
+            )
+            alerts = ask(
+                "Alerts stated in words (nov leg rob enf fra, empty = none): ",
+                parse_alerts,
+                input_fn,
+                print_fn,
+            )
+            recommends = ask("Recommends it in words? [y/n]: ", parse_yes_no, input_fn, print_fn)
         except Quit:
             break
         append_jsonl(
-            gold_path, gold_record(review.review_id, sentiment, aspects, would_return, labeller)
+            gold_path,
+            gold_record(
+                review.review_id,
+                labeller,
+                sentiment=sentiment,
+                opinions=opinions,
+                staff=staff,
+                incident=incident,
+                alerts=alerts,
+                recommends=recommends,
+            ),
         )
         added += 1
     return added

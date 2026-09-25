@@ -1,32 +1,35 @@
-"""Score model outputs against the human gold labels in ``gold/gold.jsonl``.
+"""Score model outputs (and layer 1) against the human labels in ``gold/gold.jsonl``.
 
-Usage: python -m review_llm_eval.evaluate [--models qwen2.5:7b-instruct gemma3:4b]
+Usage: python -m review_llm_eval.evaluate [--runs e1_4b e1_8b]
 
-This is the only place where the word "accuracy" means agreement with a human.
-If the gold file does not exist yet it says so and exits without writing anything.
+This is the only place where precision, recall or accuracy mean agreement with a human.
+If the gold file does not exist yet it says so and writes nothing.
 """
 
 from __future__ import annotations
 
 import argparse
-from collections.abc import Sequence
+import sqlite3
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
 from review_llm_eval.config import (
-    ASPECTS,
-    DEFAULT_MODELS,
+    EXPERIMENTS_DIR,
     GOLD_PATH,
     GOLD_TARGET,
-    OUTPUTS_DIR,
-    OVERALL_SENTIMENTS,
     RESULTS_DIR,
+    SAMPLE_PATH,
+    STORE_PATH,
 )
-from review_llm_eval.jsonl import iter_jsonl
-from review_llm_eval.metrics import PRF, accuracy, binary_prf, macro_f1
+from review_llm_eval.contract import ALERTS, BASE
+from review_llm_eval.data import Review
+from review_llm_eval.jsonl import iter_jsonl, read_jsonl
+from review_llm_eval.metrics import PRF, accuracy, binary_prf
+from review_llm_eval.postprocess import expand, hotel_veto, normalize_name, veto_for
 from review_llm_eval.report import markdown_table, write_csv
-from review_llm_eval.run import output_path
+from review_llm_eval.runner import load_records
 
 Row = dict[str, Any]
 
@@ -34,12 +37,12 @@ Row = dict[str, Any]
 @dataclass(frozen=True, slots=True)
 class HumanEval:
     n: int
-    sentiment_accuracy: float
-    sentiment_macro_f1: float
-    aspects: dict[str, PRF]  # presence of each aspect
-    aspects_micro: PRF
-    aspect_sentiment_accuracy: float  # on aspects both human and model marked present
-    would_return_accuracy: float
+    topics: PRF  # topic mentioned or not
+    pairs: PRF  # (topic, polarity)
+    staff: PRF
+    incident_accuracy: float
+    alerts: dict[str, PRF]
+    recommends_accuracy: float
 
 
 def load_gold(path: Path) -> dict[int, Row]:
@@ -48,52 +51,61 @@ def load_gold(path: Path) -> dict[int, Row]:
     return {row["review_id"]: row for row in iter_jsonl(path)}
 
 
-def evaluate_model(gold: dict[int, Row], results: dict[int, Row]) -> HumanEval:
-    """Compare one model with the gold labels.
+def _prf(pred: set[Any], gold: set[Any]) -> tuple[int, int, int]:
+    return len(pred & gold), len(pred - gold), len(gold - pred)
 
-    Reviews the model failed on count as wrong (an empty answer): a failure is a
-    real cost in production, so it is not silently dropped.
-    """
+
+def evaluate_outputs(
+    gold: Mapping[int, Row], outputs: Mapping[int, dict[str, Any] | None]
+) -> HumanEval:
+    """``outputs`` are expanded model outputs by review id (``None`` = the model failed,
+    counted as an empty answer: a failure is a real cost, it is not dropped)."""
+    empty: dict[str, Any] = {
+        "opinions": [],
+        "staff": [],
+        "incident": None,
+        "recommends": False,
+        **dict.fromkeys(ALERTS, False),
+    }
     ids = sorted(gold)
-    empty: Row = {"sentiment": None, "aspects": dict.fromkeys(ASPECTS), "would_return": None}
-    outputs = [
-        results[i]["output"] if i in results and results[i]["status"] == "ok" else empty
-        for i in ids
-    ]
-    golds = [gold[i] for i in ids]
-
-    y_true = [g["sentiment"] for g in golds]
-    y_pred = [o["sentiment"] for o in outputs]
-
-    per_aspect: dict[str, PRF] = {}
-    tp_all = fp_all = fn_all = 0
-    sentiment_hits: list[bool] = []
-    for aspect in ASPECTS:
-        tp = fp = fn = 0
-        for g, o in zip(golds, outputs, strict=True):
-            in_gold = aspect in g["aspects"]
-            in_model = o["aspects"].get(aspect) is not None
-            tp += in_gold and in_model
-            fp += in_model and not in_gold
-            fn += in_gold and not in_model
-            if in_gold and in_model:
-                sentiment_hits.append(g["aspects"][aspect] == o["aspects"][aspect])
-        per_aspect[aspect] = binary_prf(tp, fp, fn)
-        tp_all, fp_all, fn_all = tp_all + tp, fp_all + fp, fn_all + fn
-
+    t = p = s = (0, 0, 0)
+    alert_counts = {a: (0, 0, 0) for a in ALERTS}
+    incident_hits: list[bool] = []
+    recommends_hits: list[bool] = []
+    for rid in ids:
+        g, o = gold[rid], outputs.get(rid) or empty
+        g_pairs = {(x["topic"], x["polarity"]) for x in g["opinions"]}
+        o_pairs = {(x["topic"], x["polarity"]) for x in o["opinions"]}
+        t = tuple(
+            map(sum, zip(t, _prf({x for x, _ in o_pairs}, {x for x, _ in g_pairs}), strict=True))
+        )
+        p = tuple(map(sum, zip(p, _prf(o_pairs, g_pairs), strict=True)))
+        g_staff = {normalize_name(n) for n in g["staff"]}
+        o_staff = {normalize_name(n) for n in o["staff"]}
+        s = tuple(map(sum, zip(s, _prf(o_staff, g_staff), strict=True)))
+        for a in ALERTS:
+            hit = _prf({a} if o[a] else set(), {a} if a in g["alerts"] else set())
+            alert_counts[a] = tuple(map(sum, zip(alert_counts[a], hit, strict=True)))
+        incident_hits.append(o["incident"] == g["incident"])
+        recommends_hits.append(bool(o["recommends"]) == bool(g["recommends"]))
     return HumanEval(
         n=len(ids),
-        sentiment_accuracy=accuracy(y_true, y_pred),
-        sentiment_macro_f1=macro_f1(y_true, y_pred, OVERALL_SENTIMENTS),
-        aspects=per_aspect,
-        aspects_micro=binary_prf(tp_all, fp_all, fn_all),
-        aspect_sentiment_accuracy=(
-            sum(sentiment_hits) / len(sentiment_hits) if sentiment_hits else float("nan")
-        ),
-        would_return_accuracy=accuracy(
-            [g["would_return"] for g in golds], [o["would_return"] for o in outputs]
-        ),
+        topics=binary_prf(*t),
+        pairs=binary_prf(*p),
+        staff=binary_prf(*s),
+        incident_accuracy=accuracy(incident_hits, [True] * len(incident_hits)),
+        alerts={a: binary_prf(*c) for a, c in alert_counts.items()},
+        recommends_accuracy=accuracy(recommends_hits, [True] * len(recommends_hits)),
     )
+
+
+def layer1_accuracy(gold: Mapping[int, Row], store_path: Path) -> tuple[int, float]:
+    if not store_path.exists():
+        return 0, float("nan")
+    conn = sqlite3.connect(store_path)
+    rows = dict(conn.execute("SELECT review_id, sentiment FROM review_enrichment").fetchall())
+    ids = [i for i in gold if i in rows]
+    return len(ids), accuracy([gold[i]["sentiment"] for i in ids], [rows[i] for i in ids])
 
 
 def pending_message(n_labelled: int, target: int = GOLD_TARGET) -> str:
@@ -102,9 +114,11 @@ def pending_message(n_labelled: int, target: int = GOLD_TARGET) -> str:
 
 def main(argv: Sequence[str] | None = None) -> None:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--models", nargs="+", default=list(DEFAULT_MODELS))
+    parser.add_argument("--runs", nargs="+", default=["e1_4b", "e1_8b"])
     parser.add_argument("--gold", type=Path, default=GOLD_PATH)
-    parser.add_argument("--outputs", type=Path, default=OUTPUTS_DIR)
+    parser.add_argument("--experiments", type=Path, default=EXPERIMENTS_DIR)
+    parser.add_argument("--sample", type=Path, default=SAMPLE_PATH)
+    parser.add_argument("--store", type=Path, default=STORE_PATH)
     parser.add_argument("--results", type=Path, default=RESULTS_DIR)
     parser.add_argument("--min-labels", type=int, default=GOLD_TARGET)
     args = parser.parse_args(argv)
@@ -116,40 +130,42 @@ def main(argv: Sequence[str] | None = None) -> None:
             return
         print("(scoring the partial gold set anyway; numbers are provisional)")
 
-    summary_headers = [
-        "model", "n", "sentiment_accuracy", "sentiment_macro_f1", "aspect_micro_precision",
-        "aspect_micro_recall", "aspect_micro_f1", "aspect_sentiment_accuracy",
-        "would_return_accuracy",
+    reviews = {r["review_id"]: Review.from_dict(r) for r in read_jsonl(args.sample)}
+    base = hotel_veto({r.hotel for r in reviews.values()})
+    headers = [
+        "run", "n", "topic_P", "topic_R", "topic_F1", "pair_P", "pair_R", "pair_F1",
+        "staff_P", "staff_R", "incident_acc", "recommends_acc",
     ]  # fmt: skip
-    summary_rows: list[list[Any]] = []
-    aspect_rows: list[list[Any]] = []
-    for model in args.models:
-        path = output_path(model, root=args.outputs)
-        results = {row["review_id"]: row for row in iter_jsonl(path)} if path.exists() else {}
-        ev = evaluate_model(gold, results)
-        micro = ev.aspects_micro
-        summary_rows.append(
+    rows: list[list[Any]] = []
+    alert_rows: list[list[Any]] = []
+    for run_id in args.runs:
+        outputs: dict[int, dict[str, Any] | None] = {}
+        for rec in load_records(args.experiments, run_id):
+            out = (rec.get("extraction") or {}).get("output")
+            rv = reviews.get(rec["review_id"])
+            if out is not None and rv is not None:
+                outputs[rec["review_id"]] = expand(
+                    out, BASE, rv.full_text, veto_for(rv.hotel, base)
+                )
+        ev = evaluate_outputs(gold, outputs)
+        rows.append(
             [
-                model,
-                ev.n,
-                ev.sentiment_accuracy,
-                ev.sentiment_macro_f1,
-                micro.precision,
-                micro.recall,
-                micro.f1,
-                ev.aspect_sentiment_accuracy,
-                ev.would_return_accuracy,
+                run_id, ev.n, ev.topics.precision, ev.topics.recall, ev.topics.f1,
+                ev.pairs.precision, ev.pairs.recall, ev.pairs.f1, ev.staff.precision,
+                ev.staff.recall, ev.incident_accuracy, ev.recommends_accuracy,
             ]
-        )
-        for aspect, prf in ev.aspects.items():
-            aspect_rows.append([model, aspect, prf.support, prf.precision, prf.recall, prf.f1])
-
-    aspect_headers = ["model", "aspect", "gold_support", "precision", "recall", "f1"]
-    write_csv(args.results / "human_eval_summary.csv", summary_headers, summary_rows)
-    write_csv(args.results / "human_eval_aspects.csv", aspect_headers, aspect_rows)
-    print(markdown_table(summary_headers, summary_rows))
+        )  # fmt: skip
+        for alert, prf in ev.alerts.items():
+            alert_rows.append([run_id, alert, prf.support, prf.precision, prf.recall])
+    n1, acc1 = layer1_accuracy(gold, args.store)
+    write_csv(args.results / "human_eval_summary.csv", headers, rows)
+    write_csv(
+        args.results / "human_eval_alerts.csv", ["run", "alert", "gold", "P", "R"], alert_rows
+    )
+    print(markdown_table(headers, rows))
     print()
-    print(markdown_table(aspect_headers, aspect_rows))
+    print(markdown_table(["run", "alert", "gold", "P", "R"], alert_rows))
+    print(f"\nlayer 1 sentiment accuracy vs human: {acc1:.3f} on {n1} reviews")
 
 
 if __name__ == "__main__":

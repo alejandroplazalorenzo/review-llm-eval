@@ -4,8 +4,8 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "review-llm-eval"
-version = "0.1.0"
-description = "Classify Spanish hotel reviews with a local LLM under a JSON Schema and measure how reliable the output is."
+version = "0.2.0"
+description = "Review enrichment with a local LLM (Ollama, JSON Schema) plus a sentiment layer, re-measured on public Spanish hotel reviews."
 readme = "README.md"
 requires-python = ">=3.11"
 license = "MIT"
@@ -19,6 +19,10 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
+# Layer 1 (sentiment and emotion). Heavy (torch, transformers); not needed for the tests.
+layer1 = [
+    "pysentimiento>=0.7",
+]
 dev = [
     "pytest>=8",
     "ruff>=0.6",
@@ -34,6 +38,10 @@ src = ["src", "tests"]
 
 [tool.ruff.lint]
 select = ["E", "F", "W", "I", "B", "UP", "SIM", "RUF"]
+
+[tool.ruff.lint.per-file-ignores]
+# The prompt is data: wrapping its lines would change what the model reads.
+"src/review_llm_eval/prompt.py" = ["E501"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

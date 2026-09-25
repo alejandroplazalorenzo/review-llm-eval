@@ -1,70 +1,63 @@
-"""Test helpers (synthetic data and a scripted fake LLM client)."""
+"""Test helpers: a schema-valid model output and a scripted fake LLM client."""
 
 from __future__ import annotations
 
 import copy
+import json
 from typing import Any
 
-from review_llm_eval.client import ChatResponse
-from review_llm_eval.config import ASPECTS
+from review_llm_eval.client import Generation
 
 
-def make_output(
-    sentiment: str = "positive",
-    complaint: str | None = None,
-    would_return: bool | None = None,
-    **aspects: str | None,
-) -> dict[str, Any]:
-    """A schema-valid model output; aspects not given are null."""
-    return {
-        "aspects": {a: aspects.get(a) for a in ASPECTS},
-        "complaint": complaint,
-        "would_return": would_return,
-        "sentiment": sentiment,
-    }
-
-
-def ok_row(review_id: int, output: dict[str, Any], **extra: Any) -> dict[str, Any]:
-    """A result row as written by ``run.py`` for a valid first-attempt answer."""
-    row: dict[str, Any] = {
-        "review_id": review_id,
-        "status": "ok",
-        "output": output,
-        "raw": str(output),
-        "n_attempts": 1,
-        "latency_s": 1.0,
-        "attempts": [
-            {
-                "latency_s": 1.0,
-                "error": None,
-                "done_reason": "stop",
-                "total_duration_s": 0.9,
-                "prompt_eval_count": 500,
-                "eval_count": 100,
-            }
+def make_output(**overrides: Any) -> dict[str, Any]:
+    """A schema-valid answer in the production (short-key) contract."""
+    out: dict[str, Any] = {
+        "ops": [
+            {"t": "hab", "p": "neg", "lit": "el aire acondicionado no funcionaba"},
+            {"t": "atn", "p": "pos", "lit": "Marta fue muy amable"},
         ],
+        "emp": ["Marta"],
+        "inc": "ignored",
+        "nov": True,
+        "leg": False,
+        "rob": False,
+        "enf": False,
+        "fra": False,
+        "ret": False,
+        "kid": True,
+        "recom": False,
+        "noc": 7,
+        "idi": "es",
+        "rsm": "El aire acondicionado falló y nadie lo arregló.",
     }
-    row.update(extra)
-    return row
+    out.update(copy.deepcopy(overrides))
+    return out
 
 
 class FakeClient:
-    """Stand-in for ``OllamaClient``: returns (or raises) the scripted items in order
-    and records every call."""
+    """Stand-in for ``OllamaClient``: returns (or raises) the scripted items in order and
+    records every call. A dict is serialised to JSON; a string is returned as is."""
 
-    def __init__(self, script: list[str | Exception]) -> None:
+    def __init__(self, script: list[Any], done_reason: str = "stop") -> None:
         self.script = list(script)
+        self.done_reason = done_reason
         self.calls: list[dict[str, Any]] = []
 
-    def chat(
-        self,
-        model: str,
-        messages: list[dict[str, str]],
-        schema: dict[str, Any],
-        options: dict[str, Any],
-    ) -> ChatResponse:
-        self.calls.append({"model": model, "messages": copy.deepcopy(messages), "options": options})
-        item = self.script.pop(0)
+    def generate(
+        self, model: str, prompt: str, schema: dict[str, Any], temperature: float
+    ) -> Generation:
+        self.calls.append(
+            {"model": model, "prompt": prompt, "schema": schema, "temperature": temperature}
+        )
+        item = self.script.pop(0) if len(self.script) > 1 else self.script[0]
         if isinstance(item, Exception):
             raise item
-        return ChatResponse(content=item, done_reason="stop", total_duration_s=0.5, eval_count=10)
+        text = item if isinstance(item, str) else json.dumps(item, ensure_ascii=False)
+        return Generation(
+            response=text,
+            done_reason=self.done_reason,
+            eval_count=100,
+            prompt_eval_count=900,
+            total_duration_s=1.0,
+            eval_duration_s=0.8,
+        )
