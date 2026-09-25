@@ -1,3 +1,0 @@
-model,runs_compared,n,raw_text_identical,parsed_output_identical,sentiment_identical,aspect_values_identical,aspect_cells_identical,would_return_identical,complaint_identical
-qwen2.5:7b-instruct,main vs rerun,50,0.6000,0.6000,1.0000,0.8400,0.9817,1.0000,0.6600
-gemma3:4b,main vs rerun,50,0.5600,0.5600,1.0000,0.8400,0.9867,1.0000,0.6400

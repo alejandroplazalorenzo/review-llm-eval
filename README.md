@@ -1,377 +1,233 @@
 # review-llm-eval
 
-Classifies Spanish hotel reviews with a **local LLM** (Ollama) under a **JSON Schema**
-(overall sentiment, 12 aspects with their own sentiment, a main complaint and a
-"would return" flag), and then **measures how far that output can be trusted**:
-schema validity, latency, agreement with star ratings, agreement between two models,
-run-to-run stability, and the tooling for a human-labelled evaluation.
+A rebuild, on public data, of the review-enrichment pipeline I run at work on
+automotive dealer reviews, plus the experiments that re-measure each of its decisions.
+Every review goes through two layers:
 
-## Why
+1. **Layer 1, no LLM:** sentiment and emotion with
+   [pysentimiento](https://github.com/pysentimiento/pysentimiento) (RoBERTuito), the
+   language with a deterministic detector, the date precision from metadata.
+2. **Layer 2, a local LLM** (`qwen3:4b` in Ollama) under a JSON Schema: opinions per
+   topic with a literal quote, staff names, an incident code, explicit-only alert flags,
+   a few guest qualifiers and a short summary in Spanish.
 
-A classifier that is right 90 % of the time and one that is right 60 % of the time
-produce equally well-formed JSON. Schema validity tells you the output can be parsed,
-not that it is true. LLM output is only useful downstream (dashboards, alerts, reports)
-if you know how often it is wrong and in which way. This repository keeps those two
-questions apart and labels every number for what it is: a measurement of format, a
-noisy proxy, an agreement between models, or (pending) accuracy against a human.
+Deterministic post-processing repairs what code can decide, quality gates check the
+stored output after every run, and experiments E1-E10 re-measure the production
+decisions on 33,038 Spanish hotel reviews
+([`beltrewilton/punta-cana-spanish-reviews`](https://huggingface.co/datasets/beltrewilton/punta-cana-spanish-reviews), MIT).
+
+The README keeps two things apart: the **decisions** I took in production (stated
+without internal figures) and what this repository **re-measured on public data**
+(every number below comes from a file in [`results/`](results/), which gives the
+command, n, date, Ollama version and model digest of each run). Where the public data
+disagrees with what I saw in production, the table says so.
+
+## At a glance: qwen3:4b vs qwen3:8b
+
+Same contract, same prompt, same 200 reviews (40 per star rating), production settings,
+RTX 3070 Laptop GPU (8 GB). Sources: [`results/e1_model_choice.md`](results/e1_model_choice.md)
+and [`results/e8_threads.md`](results/e8_threads.md).
+
+| | qwen3:4b | qwen3:8b |
+| --- | --- | --- |
+| Schema-valid answer at the first attempt | 200 / 200 | 199 / 200 (1 cut at `num_predict`, not rescued) |
+| Reviews per minute, 4 client threads | **22.3** | 13.7 |
+| Reviews per minute, 1 thread | 12.9 / 12.0 (two passes) | 7.1 |
+| Decode speed of one request alone (tok/s) | 72 / 75 | 46 |
+| Output tokens per review (mean) | 316 | 347 |
+| Valid outputs repeating a (topic, polarity) pair | 19.0 % | 35.7 % |
+| Staff names not written in the review | 0 of 166 | 2 of 175 |
+| Job titles returned as staff names | 5 | 0 |
+| Quotes not supported by the review (before post-processing) | 6 of 685 | 1 of 849 |
+| Objective checks where the model is better or equal (of 10) | **7** | 4 |
+| (topic, polarity) F1 against a stronger model's blind labels, 100 reviews | 0.63 | **0.66** |
+
+The two tags are **different generations**: the local `qwen3:4b` (digest
+`359d7dd4bcda`) is the 2507 "thinking" release, the `qwen3:8b` (`500a1f067a9f`) is the
+original Qwen3 release. The comparison is between those two artefacts as Ollama ships
+them, not between two sizes of one model.
 
 ## Architecture
 
 ```
-Hugging Face parquet (34,561 reviews)
-        │  fetch.py
-        ▼
-data/raw/ ──► sample.py: de-duplicate, 70 reviews per star rating, seed 42 ──► data/sample.jsonl (350)
-                                                                                     │
-        ┌────────────────────────────────────────────────────────────────────────────┘
-        ▼
-run.py (4 worker threads) ── per review ─────────────────────────────────────────────┐
-  prompt.py   system prompt + "Title / Review" (no stars, no hotel name)             │
-  client.py   POST 127.0.0.1:11434/api/chat  format=<JSON Schema>, T=0, seed=42       │
-  schema.py   jsonschema validation ── invalid? ──► 1 retry with the validator error  │
-  classify.py record raw text, parsed output, attempts, latency, token counts         │
-        ▼                                                                            │
-data/outputs/<model>.jsonl (+ .run.json with wall-clock time) ◄───────────────────────┘
-        │
-        ├─► analyze.py      ──► results/*.csv, results/summary.md   (reliability, proxy, agreement)
-        ├─► experiments.py  ──► results/stability.csv, results/optional_fields.csv
-        └─► label.py (human, blind) ──► gold/gold.jsonl ──► evaluate.py ──► results/human_eval_*.csv
+Hugging Face parquet (34,561 rows)
+   │ fetch.py
+   ▼
+ingest.py: normalise, drop exact repeats (33,038 left), month from `wrote`
+   │                                   ──► SQLite `review` (source data only)
+   ▼
+enrich.py ─ layer 1 (layer1.py): pysentimiento sentiment + emotion, langdetect.py
+   │        ──► `review_enrichment` (version = layer 1)
+   ├─ layer 2 (extract.py, 4 threads, batches of 25, commit per batch)
+   │    prompt.py   one prompt: review block (rating, title, text) then instructions
+   │    client.py   POST 127.0.0.1:11434/api/generate  format=<schema> think=false
+   │                keep_alive=30m  temperature 0, retry at 0.4  num_ctx 4096
+   │                num_predict 1024
+   │    contract.py short keys, every key required, re-validated with jsonschema
+   │    postprocess.py  expand codes, de-duplicate, drop filler / invented quotes,
+   │                    check staff names against the text, veto roles and hotels
+   │    ──► `review_enrichment` (version = layer1+model/prompt, raw output kept)
+   └─ gates.py  quality gates on the stored rows ──► results/gates.md
+
+experiments.py (runner.py, checks.py, analysis.py) ──► data/experiments/ ──► results/*.md
+label.py / evaluate.py / alerts_review.py: human labels only (gold/)
 ```
 
-Everything is plain Python (`requests`, `jsonschema`, `pyarrow`); metrics are
-implemented by hand in `metrics.py` and unit-tested against known values.
+Plain Python (`requests`, `jsonschema`, `pyarrow`, `sqlite3`); `pysentimiento` is an
+optional extra for layer 1. Metrics are implemented by hand in `metrics.py`.
+
+## Decisions from my production system (no internal figures)
+
+What the production pipeline does and why, as I decided it on the real data. The
+numbers behind these decisions stay private; the last column says where this repository
+measures the same question again.
+
+| Decision | Why | Re-measured here |
+| --- | --- | --- |
+| Overall sentiment from a dedicated classifier (pysentimiento), not from the LLM; irony detection dropped | Cheaper, runs on CPU, does not move when the prompt changes; the irony classifier gave false positives on ordinary reviews | layer 1 of the pipeline (not an experiment) |
+| Language from a deterministic word-list detector; the model's answer kept only in the raw output | The model under-counted reviews written in other languages | L11 |
+| Date precision and business line come from metadata; metadata overrides the model's area where the location is not a dealership | The source knows them; the model can only guess | month from `wrote`; no area field here |
+| `qwen3:4b` over `qwen3:8b` | Measured on a sample of real reviews: faster, and better or equal on objective checks. Only some of those checks were written down at the time, so E1 writes ten down in code and applies them to both models | E1, E8 |
+| `/api/generate`, one prompt, review first; `format` = JSON Schema, every answer re-validated with `jsonschema`; `think: false` | Constrained decoding, never trusted blindly; a thinking model spends tokens before the JSON | E6 |
+| Short keys and short enum codes, expanded in Python | Output tokens are the cost of every call | E2 |
+| Every key required, nullable only by type | An optional key under constrained decoding stopped being emitted and a whole column stayed NULL | E3 |
+| Two attempts, same prompt, temperature 0 then 0.4; a row still invalid stays pending with a warning | At temperature 0 the retry repeated the failure (a string that runs until `num_predict`) | E4 |
+| Summary length described in words and tied to the rating | A numeric word limit was echoed inside the summary and caused runaways | E5 |
+| `127.0.0.1`, not `localhost` | On Windows `localhost` tried IPv6 first and every call paid for it | E7 |
+| 4 client threads with `OLLAMA_NUM_PARALLEL=4` (flash attention, `q8_0` KV cache) | Generation is memory-bandwidth bound; parallel requests amortise it up to a point | E8 |
+| `keep_alive: "30m"` | Without it the model was unloaded after 5 idle minutes and the next call paid for the reload | E9 |
+| Deterministic post-processing: de-duplicate (topic, sentiment), drop filler quotes and quotes not found in the text, staff names must be written in the review (never taken from the business reply), job titles and brand names vetoed | Asking the model costs tokens and guarantees nothing; code does it for sure. Thresholds sit in an empty gap of the observed distribution | E1 checks, quote support |
+| Alerts are booleans that need an explicit statement; precision over recall; calibrated by reading small batches by hand | An alert feeds a person's inbox: a false one costs more than a missed one | E1, gates, `alerts_review.py` |
+| Incident enum defaults to "none"; high precision, low recall on purpose | Rewording did not fix the recall, and the variant that did made it fire on happy reviews | incident wording |
+| Short positive reviews are not skipped | Their opinions are filler and they never raise an alert, but some of them name an employee | short positives |
+| Model version and prompt version on every row, content hash, raw output stored, `--reprocess` | A mapping change can be re-applied without the GPU; a new prompt redoes only old rows | `enrich --remap`, `--reprocess` |
+| Commit per batch, "pending" is a query, abort after 5 network errors in a row, a failed health check falls back to layer 1 | Backfills run for hours on a shared desktop | pipeline tests |
+| Quality gates on the stored output: a field that never varies is broken; no duplicates; literal quotes; names in the text; no role as a name; few alerts on 4-5 stars | Each one watches a failure that passed the schema in some version | `gates.py`, run after every `enrich` |
+| Golden checks are hand-verified aggregates, not LLM labels; there is no human gold set for opinions yet | A model cannot measure how often a model is wrong | golden gate; `label.py` (pending, see below) |
+| The rating goes into the prompt | It is context the customer gave, and it sets the summary length | prompt |
+| Business-reply judgement (four fields, null when there is no reply) | The block had to start with the "there is a reply" case or the model anchored on null | not reproducible: the dataset has no replies |
+
+## Re-measured here on public data
+
+**Setup.** RTX 3070 Laptop GPU (8 GB), Windows 11, Ollama 0.34.2 (runs of 23 Sep 2026)
+and 0.34.3 (runs of 24 Sep 2026), server with `OLLAMA_NUM_PARALLEL=4`,
+`OLLAMA_FLASH_ATTENTION=1`, `OLLAMA_KV_CACHE_TYPE=q8_0`. Model digests `359d7dd4bcda`
+(qwen3:4b) and `500a1f067a9f` (qwen3:8b). Main sample: 200 reviews, 40 per star rating
+(seed 42), so rates are not rates of the natural distribution (88 % of the dataset is
+4-5 stars). Each experiment writes one file in `results/`; `results/runs.csv` lists every
+run with its date, n, digest and Ollama version.
+
+**Noise floor.** The same run repeated (E10, 4 threads) gave 22.3 and 19.1 reviews/min:
+this laptop GPU ends the runs at 78-89 °C (median 88 °C, recorded in `results/runs.csv`)
+and throttles, so throughput differences under about 15 % between runs are not evidence
+of anything. The second pass of the thread curve,
+on the newer Ollama version (21.7 vs 21.0 reviews/min at 4 threads), shows that the
+version change between the two days did not move the speed.
+
+| # | Lesson from production | Here | Evidence |
+| --- | --- | --- | --- |
+| E1 | A smaller model can be faster and better | **Faster: reproduced. Better: mixed** | qwen3:4b: 22.3 vs 13.7 reviews/min (1.6×), 200/200 valid vs 199/200, better or equal on 7 of 10 objective checks (the 8b: 4 of 10; the checks were fixed after the 4b run and before the 8b run). The 4b halves the duplicated opinions (19.0 % vs 35.7 %) but returns more job titles as names (5 vs 0) and more unsupported quotes (6 vs 1). Against a stronger model's blind labels the 8b finds a few more opinions and names (pair F1 0.66 vs 0.63): the 4b is a speed choice. [e1](results/e1_model_choice.md), [judge](results/judge_agreement.md) |
+| E2 | Output tokens are the cost: short keys | **Direction reproduced, size not** | Long keys: 331 vs 316 output tokens (+5 %), 19.8 vs 22.3 reviews/min, inside the noise floor. Here the long names are English identifiers that take few tokens, so there is little to save. The long keys also changed the answers: identical opinion sets in 39 % of reviews against 80 % for a plain repeat, and the no-return alert fired 51 times instead of 85. [e2](results/e2_short_keys.md) |
+| E3 | Optional keys disappear under constrained decoding | **Reproduced, both models** | Free-text incident left out of `required`: the key appeared in **0 of 100** answers with qwen3:4b and 0 of 100 with qwen3:8b. Kept in `required`, it appeared in all of them and was non-null in 45 % (4b) and 41 % (8b). [e3](results/e3_optional_fields.md) |
+| E4 | A retry at T=0 repeats the failure; with temperature it is rescued | **Partly** | qwen3:4b never ran away (0 of 2,550 first attempts cut at `num_predict`, all runs). qwen3:8b did 13 times in 664, 8 of them on the same review, which ran away in 8 of the 10 qwen3:8b runs that included it (all but the two E3 variants); the production retry (one call at 0.4) rescued 4 of the 13. Failures induced on qwen3:4b by lowering `num_predict` to 367 (24 of 27 reviews cut): re-asked at T=0, 1 of 48 calls came back valid and half were byte-identical to the failed answer; at T=0.4, 18 of 120 calls were valid and 7 of the 24 reviews were rescued by at least one of five calls. Temperature helps, but a single retry rescues a minority. [e4](results/e4_retry_temperature.md) |
+| E5 | A numeric word limit is echoed and causes runaways | **Not reproduced** | "N palabras como máximo": 0 runaways in both runs and 2 echoes in 200 summaries (1 with the description in words). The numeric limit shortened the summaries (27.7 vs 33.9 words) and 133 of 200 still exceeded it. [e5](results/e5_summary_length.md) |
+| E6 | Thinking and `format` do not mix: `think: false` | **Reproduced on the 4b** | qwen3:4b with `think` left out or `true`: **0 of 24** valid answers. The `response` came back empty and the JSON arrived in the `thinking` field (exactly the length and token count of the `think: false` answer for 13 of the 24 reviews; 1,003 vs 1,007 characters on average). With `think: false`, 24 of 24. qwen3:8b never produced thinking text with `format` set: 23 of 24 valid with `false`, 21-22 of 24 with the other two (3 runaways instead of 1). [e6](results/e6_thinking.md) |
+| E7 | `localhost` costs time on every call on Windows | **Reproduced** | 50 calls in series: 2.1 s of client-side overhead per call with `localhost` vs 0.03 s with `127.0.0.1`; 9.9 vs 12.5 reviews/min. [e7](results/e7_localhost.md) |
+| E8 | 4 threads with `OLLAMA_NUM_PARALLEL=4`; more threads do not help | **Partly** | qwen3:4b, two passes: 1 thread 12.9 / 12.0, 2 threads 10.6 / 11.4, 4 threads 21.0 / 21.7, 8 threads 25.2 / 24.0 reviews/min. Four threads nearly double the throughput, as in production, but here 8 still add 11-20 % (the extra requests queue in the server; median latency per review 10-11 s → 17-18 s) and 2 threads are slower than 1. qwen3:8b: 7.1, 8.9, 13.1, 15.2. [e8](results/e8_threads.md) |
+| E9 | Without `keep_alive` the model is reloaded after 5 idle minutes | **Reproduced (one clean repetition)** | After 330 s idle with the server default, the model had been unloaded and the next call took 11.4 s (6.1 s of loading), against 5.0-5.2 s with `keep_alive: 30m`. The second repetition of the default case measures something else: it followed a request with `30m`, and a request that leaves `keep_alive` out did not shorten that timer (model still loaded, 5.1 s). [e9](results/e9_keep_alive.md) |
+| E10 | Temperature 0 is not fully repeatable | **Partly** | One request at a time: 99 of 100 answers byte-identical. With 4 threads: 36 % byte-identical JSON, 80 % identical opinion sets, 42 % identical summaries; the flags stay at 98-100 %. The variation comes from running requests concurrently, not from temperature 0 itself. [e10](results/e10_repeatability.md) |
+| L10 | Deterministic work belongs in code, thresholds in an empty gap | **Reproduced** | Of the 1,534 non-filler quotes in E1, none has a support in [0.4, 0.6); the 7 below that gap copy the topic definitions of the prompt. The post-processing removes both problems in the stored rows (0 repeated pairs; 99.2 % of the kept quotes literal). [quotes](results/quote_support.md), [gates](results/gates.md) |
+| L11 | Do not ask the model what a detector knows | **Reproduced** | On the 38 reviews the detector marks as not Spanish, the model answered "es" for 37. Many of them are bilingual, but 11 contain no Spanish function word at all, and the model called all 11 Spanish. [l11](results/l11_language.md) |
+| L12 | Alerts extracted, not inferred ("only when the text says it") | **Not reproduced: open problem** | The gate on 4-5 star reviews passes (0 alerts without a phrase), but the no-return alert fires on 40 of 40 one-star reviews with qwen3:4b (35 of 40 with the 8b), and 60 of its 85 hits have no no-return phrase that the deliberately broad regex can find. It looks as if the model infers the alert from the stars and the tone, whatever the wording says. A stronger model read the 85 hits and found the statement in 28; on the 100 reviews it labelled blind, the 4b raises the alert on all 20 one-star reviews where 5 say it (precision 0.36, recall 1.00). "Explicitly recommends" is over-flagged the same way (36 flagged, 6 explicit). [e1](results/e1_model_choice.md), [judge](results/judge_agreement.md) |
+| L13 | Rewording the prompt does not move fine judgements | **Partly** | Incident field, 120 reviews: without the "none" default, recall on 1-2 stars went 40 % → 48 %; with example phrases, 31 %; as a list, 85 %, but then it fired 40 times on reviews with no incident phrase (11 with the production wording). Unlike production, the list never fired on 5-star reviews here. [incident](results/nice_incident_wording.md) |
+| L14 | Gates on the real output catch what the schema cannot | **Mechanism only** | All gates pass on the 200-row pipeline run; `legal_action` never varied, but only 2 of those reviews contain a legal phrase, below the minimum to demand variation. [gates](results/gates.md) |
+| L16 | Sometimes the stars are wrong, not the model | **Observed** | 4 of the 200 reviews have 4-5 stars and are read as negative by both layers. [gap](results/star_text_gap.md) |
+| L17 | Business-reply judgement and its null anchoring | **Not reproducible here** | The dataset has no business replies. |
+| Nice | `maxLength` on quotes and summary | **Not reproduced** | Limits at the 95th percentile of the E1 lengths: 21.6 vs 22.3 reviews/min (no gain; there were no runaways to cut); identical quotes 63 % vs 74 % for a plain repeat. [maxLength](results/nice_maxlength.md) |
+| Nice | Instructions first, so the server caches the prefix | **Reproduced** | Prompt processing 0.22 s vs 0.55 s per call, but the answers change: identical opinion sets in 16 % of reviews (80 % for a repeat), no-return alerts 41 vs 85. Not adopted, as in production. 4 calls of this run got an HTTP 500 in the same second and are counted apart. [order](results/nice_prompt_order.md) |
+| Nice | Skipping short positive reviews | **Reproduced** | 4-5 star reviews under 241 characters (21.8 % of the dataset): no alerts, but 11 of 22 name a staff member. [short](results/nice_short_positives.md) |
+
+### What these numbers are not
+
+- **No human accuracy figure.** The only reference labels come from a stronger model
+  (Claude Opus 5.5), which labelled the 100 reviews of the `label.py` queue blind and read
+  every alert the pipeline raised: [results/judge_agreement.md](results/judge_agreement.md).
+  That is agreement with another model, not accuracy. The human gold set (`label.py`,
+  `alerts_review.py`) is still pending, and `gold/` is empty.
+- **The regex in `cues.py` is a broad net** used to find suspicious hits, never a label.
+- **Speed numbers are from one laptop GPU** that throttles under long runs (the GPU
+  temperature and clock are recorded before and after each run). Compare runs inside
+  the same table, and treat differences under ~15 % as noise.
+- **Balanced sample.** 40 reviews per star; per-star figures are more meaningful than
+  totals.
 
 ## Output contract
 
-Schema: `src/review_llm_eval/schema.py` (version 1.0). Every field is **required**;
-"unknown" is an explicit `null`. `additionalProperties: false` everywhere.
+`src/review_llm_eval/contract.py` (JSON Schema) and `prompt.py` (wording), written from
+scratch for hotels. Every key is required; the model writes short keys and codes, and
+`postprocess.expand` turns them into the column names of the database.
 
-| Field | Type | Values | Meaning |
+| Key | Column | Type | Content |
 | --- | --- | --- | --- |
-| `aspects` | object with 12 required keys | each `positive` \| `neutral` \| `negative` \| `mixed` \| `null` | opinion about `staff`, `cleanliness`, `room`, `food`, `pool_beach`, `location`, `value`, `check_in`, `noise`, `safety`, `entertainment`, `other`; `null` = not mentioned |
-| `complaint` | string (≤ 120 chars) or `null` | free text | main complaint, in English, ≤ 15 words |
-| `would_return` | boolean or `null` | `true` / `false` / `null` | only if the reviewer says so; `null` = not stated |
-| `sentiment` | string | `positive` \| `neutral` \| `negative` \| `mixed` | overall sentiment of the review |
+| `ops` | `opinions` | list of `{t, p, lit}` | one item per topic with a real opinion: topic code (13 topics: room, cleanliness, food, drinks, pools, beach, staff service, entertainment, value, front desk, noise, safety/health, grounds/location), polarity `pos` / `neg` / `neu`, and a short quote copied from the review |
+| `emp` | `staff` | list of strings | names of hotel workers written in the review |
+| `inc` | `incident` | enum, default `none` | long wait, room change, unexpected charge, booking problem, complaint ignored |
+| `nov` `leg` `rob` `enf` `fra` | alerts | boolean | says they will not return / legal or formal action / theft / illness / accuses the hotel of bad faith; only when the text says it |
+| `ret` `kid` `recom` | qualifiers | boolean | returning guest / travelling with children / explicitly recommends |
+| `noc` | `nights` | integer or null | nights of the stay, when stated (nullable by type) |
+| `idi` | raw output only | enum | language according to the model; the stored language comes from the detector |
+| `rsm` | `summary` | string | "un par de frases" for 1-3 stars, "una frase breve" for 4-5 |
 
-Keys are generated in this order on purpose (evidence first, verdict last). Every
-stored result also keeps the raw model text, the number of attempts, the validator
-error of each failed attempt, latency and Ollama's token counts.
+Stored next to them: layer 1 (`sentiment`, `sentiment_score`, `emotion`, `language`),
+`raw_output` (the JSON as the model returned it), `llm_attempts`, `content_hash` and
+`model_version` = `pysentimiento-robertuito+langdet-v1/v1+qwen3:4b/prompt-v1`.
+[`results/example_outputs.jsonl`](results/example_outputs.jsonl) shows ten stored rows,
+pseudonymised.
 
-## Design decisions
-
-| Decision | Rejected alternative | Why |
-| --- | --- | --- |
-| **Local model** (Ollama, quantised 4-7B) | Hosted API | Reviews are customer data; locally nothing leaves the machine and a full re-run of the sample costs nothing (7-8 minutes here), so every prompt change can be re-measured. The Ollama digest pins the exact weights. The price is smaller models with the failure modes described below. |
-| **Constrained decoding**: the schema goes in Ollama's `format` field | "Answer in JSON" in the prompt + parse/repair | 700 of 700 answers were schema-valid at the first attempt (see results). Every answer is still re-validated with `jsonschema`, because a grammar does not stop generation at the token limit and not every schema keyword is necessarily enforced during decoding. The prompt-only alternative was not measured here. |
-| **Required + nullable** fields | Optional fields | Measured (50 reviews per model): with `complaint` and `would_return` made optional, both models still emitted both keys in 100 % of answers, but the keys were moved after `sentiment` in 100 % of answers. "Optional" did not mean "omitted when unknown"; it silently changed the generation order. Required + `null` keeps "not stated" explicit and the order under control. |
-| **Fixed aspect keys** (all 12 always present) | A list of `{aspect, sentiment}` for mentioned aspects only | No duplicates, no invented aspect names, and every aspect gets an explicit decision, which makes comparison trivial. Observed cost: `gemma3:4b` fills aspects that are not discussed with `neutral` (see error analysis). The list design was not measured. |
-| **Temperature 0 + fixed seed** | Sampling with self-consistency voting | Lowest variance at 1× cost. Measured: this is **not** bit-for-bit reproducible with 4 concurrent requests (see stability). |
-| **One retry that shows the model its invalid answer and the validator error** | Retry the identical request | At temperature 0 an identical request is likely to reproduce the same answer. Note: the retry path never triggered in the real runs (0 invalid answers); it is covered by mocked tests only. |
-| **Star rating hidden** from the model and from the human labeller | Give the rating as context | The rating is the proxy label; showing it would make the proxy check meaningless and anchor the human. |
-| **Balanced sample** (70 per star) | Proportional sample | The dataset is 77 % five-star (26,708 / 34,561); a proportional sample of 350 would contain about 14 one-star and 9 two-star reviews. Consequence: the numbers below are not the accuracy on the natural distribution. |
-| **Proxy metrics + inter-model agreement now, human gold next** | LLM-generated "gold" labels / LLM-as-judge | Stars are free and independent of the models but noisy; kappa between models shows *where* they disagree, not who is right. Labels produced by an LLM cannot tell you how often an LLM is wrong, so the only accuracy figure this repository will report comes from human labels. |
-| `127.0.0.1` instead of `localhost` | `localhost` | On the development machine a GET to `/api/version` took 2.07 s via `localhost` and 0.015 s via `127.0.0.1`. |
-
-## Results
-
-All numbers were produced on **2026-09-23** by the commands shown, on the sample of
-350 reviews (70 per star rating). Setup: Windows 11, RTX 3070 8 GB, Ollama 0.34.2
-(`OLLAMA_NUM_PARALLEL=4`, flash attention on, `q8_0` KV cache), Python 3.13.7,
-`qwen2.5:7b-instruct` (Q4_K_M, digest `845dbda0ea48`) and `gemma3:4b` (Q4_K_M, digest
-`a2af6cc3eb7f`), options `temperature=0, seed=42, num_ctx=4096, num_predict=512`,
-4 concurrent requests, one model loaded at a time. Full tables: [`results/`](results/)
-(`summary.md` is the generated overview).
-
-```
-python -m review_llm_eval.run --model qwen2.5:7b-instruct
-python -m review_llm_eval.run --model gemma3:4b
-python -m review_llm_eval.analyze
-```
-
-### 1. Reliability of the structured output
-
-| Model | Schema-valid | Valid at 1st attempt | Retries | Failures | Token-limit stops | Latency mean / p50 / p95 | Throughput |
-| --- | --- | --- | --- | --- | --- | --- | --- |
-| qwen2.5:7b-instruct | 350/350 (100 %) | 350/350 | 0 | 0 | 0 | 4.65 / 4.47 / 5.17 s | 51.5 reviews/min |
-| gemma3:4b | 350/350 (100 %) | 350/350 | 0 | 0 | 0 | 5.50 / 5.40 / 6.32 s | 43.5 reviews/min |
-
-Latency is per review as seen by the client, with 4 requests in flight. The maximum
-was about 20 s in both runs: in each run one stall hit the 4 requests in flight at
-that moment (cause not determined). Mean prompt / output tokens: 548 / 123 (qwen),
-541 / 138 (gemma). The 4B model was slower than the 7B one on this machine.
-
-### 2. Overall sentiment vs star rating (noisy proxy, **not** accuracy)
-
-1-2 stars → `negative`, 4-5 stars → `positive`; 280 reviews. A `mixed` or `neutral`
-answer counts as a miss against this binary proxy.
-
-| Model | Proxy agreement (accuracy) | Macro-F1 | F1 negative | F1 positive |
-| --- | --- | --- | --- | --- |
-| qwen2.5:7b-instruct | 0.836 | 0.898 | 0.953 | 0.843 |
-| gemma3:4b | 0.896 | 0.926 | 0.958 | 0.893 |
-
-Confusion matrices (rows: proxy, columns: model):
-
-| qwen2.5:7b-instruct | positive | neutral | negative | mixed |
-| --- | --- | --- | --- | --- |
-| **negative** (1-2★, n=140) | 0 | 0 | 132 | 8 |
-| **positive** (4-5★, n=140) | 102 | 0 | 5 | 33 |
-
-| gemma3:4b | positive | neutral | negative | mixed |
-| --- | --- | --- | --- | --- |
-| **negative** (1-2★, n=140) | 0 | 0 | 138 | 2 |
-| **positive** (4-5★, n=140) | 113 | 2 | 10 | 15 |
-
-Where the models differ is the 4-star reviews: qwen called 32 of 70 `mixed`, gemma 15.
-3-star reviews (no proxy label, n=70): qwen 40 negative / 27 mixed / 2 positive /
-1 neutral; gemma 48 negative / 15 mixed / 4 positive / 3 neutral.
-Per-star breakdown: `results/sentiment_by_rating.csv`.
-
-### 3. Agreement between the two models (agreement, **not** accuracy)
-
-Cohen's kappa on the 350 reviews. Two models can agree and both be wrong.
-
-| Item | Kappa | Raw agreement |
-| --- | --- | --- |
-| Overall sentiment (4 classes) | 0.781 | 86.9 % |
-| `would_return` (true / false / null) | 0.687 | 81.4 % |
-| Complaint present (non-null) | 0.935 | 97.4 % |
-| Aspect sentiment, when both models mark the aspect (988 pairs) | 0.726 | 83.5 % |
-
-Per aspect: "mentioned" = non-null; "with opinion" = `positive`, `negative` or `mixed`
-(i.e. ignoring `neutral`). Rates are qwen / gemma.
-
-| Aspect | Mentioned rate | Kappa (mentioned) | With-opinion rate | Kappa (with opinion) |
-| --- | --- | --- | --- | --- |
-| staff | 71 % / 95 % | 0.22 | 64 % / 80 % | 0.57 |
-| cleanliness | 30 % / 44 % | 0.68 | 27 % / 30 % | 0.85 |
-| room | 36 % / 49 % | 0.68 | 33 % / 38 % | 0.73 |
-| food | 51 % / 68 % | 0.66 | 47 % / 58 % | 0.76 |
-| pool_beach | 19 % / 38 % | 0.53 | 18 % / 27 % | 0.73 |
-| location | 7 % / 25 % | 0.29 | 5 % / 5 % | 0.55 |
-| value | 27 % / 40 % | 0.51 | 25 % / 26 % | 0.61 |
-| check_in | 14 % / 37 % | 0.40 | 13 % / 21 % | 0.62 |
-| noise | 5 % / 23 % | 0.16 | 3 % / 4 % | 0.68 |
-| safety | 9 % / 24 % | 0.29 | 8 % / 7 % | 0.83 |
-| entertainment | 23 % / 36 % | 0.60 | 22 % / 20 % | 0.83 |
-| other | 29 % / 11 % | 0.14 | 29 % / 9 % | 0.17 |
-
-Most of the aspect disagreement is `neutral`: once it is ignored, kappa rises for every
-aspect (noise 0.16 → 0.68, safety 0.29 → 0.83). The catch-all `other` stays near chance.
-
-### 4. Field usage (descriptive diagnostics, not accuracy)
-
-| | qwen2.5:7b-instruct | gemma3:4b |
-| --- | --- | --- |
-| `would_return` non-null | 81.1 % | 95.4 % |
-| `would_return` non-null on the 259 reviews with **no** return cue* | 77.6 % | 94.2 % |
-| `complaint` non-null | 73.4 % | 72.0 % |
-| Complaints that look Spanish despite "in English"** | 46.3 % | 0.0 % |
-| Aspects marked per review | 3.23 | 4.89 |
-| Reviews with all 12 aspects non-null | 0.6 % | 2.9 % |
-
-\* A review has a return cue if it matches `volv|vuelv|vuelta|regres|repet|repit|otra vez|de nuevo|nunca más`
-(deliberately broad). Without any of them the review almost certainly does not say
-whether the reviewer would return, so a non-null value there is inferred, not extracted.
-\*\* Crude stop-word vote (`analyze.looks_spanish`); spot-checked on 14 complaints per model.
-Both are heuristics for spotting problems, not labels.
-
-### 5. Run-to-run stability (same settings, 50 reviews)
-
-```
-python -m review_llm_eval.run --model <model> --limit 50 --tag rerun
-python -m review_llm_eval.experiments stability
-```
-
-| Model | Identical JSON | Same sentiment | Same `would_return` | All 12 aspects identical | Aspect cells identical | Same complaint text |
-| --- | --- | --- | --- | --- | --- | --- |
-| qwen2.5:7b-instruct | 60 % | 100 % | 100 % | 84 % | 98.2 % | 66 % |
-| gemma3:4b | 56 % | 100 % | 100 % | 84 % | 98.7 % | 64 % |
-
-Temperature 0 with a fixed seed was not reproducible under 4 concurrent requests; the
-labels were very stable, the free-text complaint was not (qwen even switched language
-between runs for the same review). A sequential (1 request at a time) comparison was
-started but aborted because another process began using the same Ollama server, which
-made both timings and model residency meaningless: **pending**.
-
-### 6. Optional fields under constrained decoding (50 reviews)
-
-```
-python -m review_llm_eval.run --model <model> --limit 50 --tag optional --schema-variant optional
-python -m review_llm_eval.experiments optional
-```
-
-With `complaint` and `would_return` removed from `required`: 100 % valid for both
-models; both keys present in 100 % of answers; key order `aspects > sentiment >
-complaint > would_return` in 100 % of answers (required keys first). `complaint`
-non-null 74 % in both variants for both models; `would_return` non-null went from 74 %
-to 86 % (qwen) and from 96 % to 98 % (gemma). Overall sentiment matched the required
-variant in 49/50 (qwen) and 48/50 (gemma) reviews; with n = 50 this says nothing
-reliable about field order.
-
-### 7. Human-labelled evaluation
-
-**Human-labelled evaluation: pending (0/200 reviews labelled).**
-
-`label.py` and `evaluate.py` are built and tested but the gold file is empty on purpose:
-the labels have to come from a person, not from a model. This is the next step, and the
-only one that turns the proxies above into an accuracy (per-aspect precision / recall /
-F1, sentiment accuracy, `would_return` accuracy).
-
-## Error analysis
-
-About 20 disagreements (model vs stars, and model vs model) were read one by one from
-`data/analysis/disagreements.jsonl`. Review ids are row indices in the public parquet
-file, so every case can be checked. Patterns actually seen:
-
-1. **The stars are wrong more often than the models.** Several 4-star reviews are
-   plainly negative: #11980 is titled *"LO PEOR."* ("the worst") and only describes
-   failed dinner bookings; #21984 says *"Es una lástima que [...] no se tenga la cultura
-   atención al cliente"*. Both models answer `negative`, and the proxy counts it as an
-   error. Part of the proxy "error" rate is label noise.
-2. **Where `mixed` begins is the main source of model disagreement.** In #13487 (4★)
-   *"Lo califico muy bueno por un percanse [...] de todas maneras recomiendo el hotel"*
-   qwen says `mixed`, gemma `positive`; in #5467 (1★), which lists *"Primero lo positivo
-   [...] Lo negativo: 1. La música en la noche..."*, qwen says `mixed` against a
-   negative proxy. The prompt's "neither dominates" is read differently by each model;
-   a human definition (the gold set) has to settle it.
-3. **Over-weighting one long complaint.** #23506 (4★) is titled *"Genial en todo, muy mal
-   servicio en mesa del buffet"* and ends *"El resto genial, gran hotel"*; gemma answers
-   `negative` because most of the text describes the buffet service.
-4. **Blaming the hotel for a third party.** In #4296 (4★, *"Muy buen resort [...]
-   realmente todo incluido"*) the complaint is about an excursion company's cameraman
-   who never delivered a DVD; gemma rates the review `negative` and sets
-   `would_return: false`, which the review never says.
-5. **`would_return` is inferred, not extracted.** Besides #4296 and #23506 (gemma:
-   `false`, nothing stated), both models set `true` on #13487 from *"recomiendo el
-   hotel"* (recommending is not returning). The field diagnostic above quantifies it:
-   94 % (gemma) and 78 % (qwen) non-null on reviews with no return cue at all.
-6. **`neutral` as a filler for "not mentioned" (gemma).** #8142 is two sentences about
-   value and food; gemma returns 12 non-null aspects, 9 of them `neutral` (noise,
-   safety, location, ...); qwen marks only `value`. The same happens on #11980. This is
-   why kappa for "mentioned" is low and kappa for "with opinion" is much higher.
-7. **Aspect sentiment flattened.** #14721 (2★) praises front desk and butlers but calls
-   the beach-buffet staff and kids-club staff rude; qwen marks `staff: positive`, gemma
-   `mixed` (the better reading).
-8. **Missed aspects.** #21984's title is *"Playas hermosas, la gente no es amable"*;
-   neither model marks `pool_beach`.
-9. **Instructions the schema cannot enforce.** 46 % of qwen's complaints are in Spanish
-   (e.g. *"Música nocturna muy fuerte interrumpiendo el descanso"*, #5467); on the rerun
-   the same review came back in English. A schema can force a string, not a language.
-10. **Source truncation leaks into the output.** The dataset cuts long reviews at about
-    790 characters (110 of the 350 sampled). #11080 ends *"- Los shows no son"*, and
-    qwen's complaint is exactly *"Los shows no son"*.
-
-## How to run
-
-Requires Python ≥ 3.11 and [Ollama](https://ollama.com) for the classification step.
+## Reproduce
 
 ```bash
-python -m venv .venv
-.venv/Scripts/python -m pip install -e ".[dev]"      # Linux/macOS: .venv/bin/python
-# (then use the venv's python for the commands below)
+python -m venv .venv && .venv/Scripts/activate      # Windows; source .venv/bin/activate elsewhere
+pip install -e ".[dev,layer1]"
+ollama pull qwen3:4b && ollama pull qwen3:8b         # compare the digests with config.py
 
-python -m review_llm_eval.fetch                     # download the parquet into data/raw/
-python -m review_llm_eval.sample                    # data/sample.jsonl, 350 reviews, seed 42
+python -m review_llm_eval.fetch                      # parquet -> data/raw/
+python -m review_llm_eval.sample                     # data/sample.jsonl (200 reviews)
+python -m review_llm_eval.ingest                     # SQLite store
+python -m review_llm_eval.enrich --sample data/sample.jsonl   # both layers + gates
 
-ollama pull qwen2.5:7b-instruct && ollama pull gemma3:4b
-python -m review_llm_eval.run --model qwen2.5:7b-instruct    # ~7 min on an RTX 3070
-python -m review_llm_eval.run --model gemma3:4b              # ~8 min
-python -m review_llm_eval.analyze                            # results/*.csv, summary.md
+python -m review_llm_eval.experiments list
+python -m review_llm_eval.experiments run E1         # E1..E10, NICE, L11, or a run id
+python -m review_llm_eval.experiments run E4         # retries (after E1, E5 and E10)
+python -m review_llm_eval.experiments run E9         # waits > 5 min, four times
+python -m review_llm_eval.experiments analyze all    # -> results/*.md, results/runs.csv
+python -m review_llm_eval.examples                   # example_outputs.jsonl, star_text_gap.md
 
-# side experiments
-python -m review_llm_eval.run --model gemma3:4b --limit 50 --tag rerun
-python -m review_llm_eval.experiments stability
-python -m review_llm_eval.run --model gemma3:4b --limit 50 --tag optional --schema-variant optional
-python -m review_llm_eval.experiments optional
-
-# human evaluation
-python -m review_llm_eval.label --labeller <your-name>       # blind: no stars, no model output
-python -m review_llm_eval.evaluate                           # scores both models against gold/
+python -m review_llm_eval.label --labeller <name>    # human gold set (pending)
+python -m review_llm_eval.alerts_review --reviewer <name>
+python -m review_llm_eval.evaluate --gold <labels.jsonl>   # score E1 against a label file
+pytest && ruff check . && ruff format --check .
 ```
 
-`run.py` resumes where it stopped (already processed reviews are skipped) unless
-`--overwrite` is given. The Ollama URL is `http://127.0.0.1:11434` (`config.py`).
-
-## Tests
-
-```bash
-pytest          # 80 tests, offline
-ruff check . && ruff format --check .
-```
-
-The LLM client is replaced by a scripted fake; an autouse fixture blocks every socket
-connection, so no test can reach Ollama or the internet. Covered: schema validation
-(valid and invalid examples, optional variant), response parsing, the retry logic
-(invalid → valid, invalid twice, transport errors), prompt building (stars and hotel
-never reach the model), sampling determinism, metrics on toy data with known answers
-(confusion matrix, precision / recall / F1, macro-F1, Cohen's kappa textbook example,
-percentiles), the labelling CLI with scripted input, and the gold evaluation.
-Fixtures are ten synthetic reviews (< 3 KB). Verified locally on Python 3.13.7; the
-GitHub Actions workflow (`.github/workflows/ci.yml`) runs ruff and pytest on Python
-3.11 and 3.12 and has not run yet because the repository has not been pushed.
-
-## Limitations and next steps
-
-- **No accuracy yet.** Until `gold/gold.jsonl` has 200 human labels, the only
-  sentiment "accuracy" is agreement with star ratings, and there is none for aspects,
-  `would_return` or `complaint`. Next: label the 200 queued reviews; ideally a second
-  person labels a subset to get human-human kappa, the ceiling any model can reach.
-- **Prompt v2** targeting what was observed: `would_return` only on an explicit
-  statement, a stricter (or no) `neutral` for aspects, an explicit rule for `mixed`,
-  and the complaint language. It should be judged against the gold set, not against
-  v1 or the other model.
-- **Narrow data**: one destination (all-inclusive resorts in Punta Cana), Spanish only,
-  350 reviews balanced by stars (not the natural 77 % five-star distribution), texts cut
-  at ~790 characters by the source.
-- **Two small quantised models, one prompt version, one run each** (plus 50-review
-  reruns). Differences of a few points between the models are within what one would
-  expect from a different sample.
-- **Determinism**: sequential (non-concurrent) reproducibility is pending.
-- **Timings** come from a shared desktop GPU; one ~15 s stall per run is unexplained.
-- The retry path is only exercised by tests; the real runs never produced invalid JSON.
-- `other` is too vague to be useful (kappa 0.14-0.17); consider dropping it.
+Every run records the server settings (read from Ollama's `server.log` on Windows), the
+model digest, the GPU state and any model another process had loaded at the time.
 
 ## Data source and licence
 
 - Dataset: [`beltrewilton/punta-cana-spanish-reviews`](https://huggingface.co/datasets/beltrewilton/punta-cana-spanish-reviews)
   on Hugging Face, **MIT licence** (as declared on the dataset card), dataset commit
-  `e4404ae54c02c1a53b9b3a5822b1fc2860a05fb1`. 34,561 Spanish hotel reviews (hotel name,
-  reviewer location, month, rating 1-5, title, text); 33,038 remain after removing
-  empty and duplicated texts. Downloaded through the Hugging Face parquet API on
-  2026-09-23.
-- The dataset is **not redistributed** here: `data/` is git-ignored. The committed
-  `results/` files are aggregates; `results/example_outputs.jsonl` holds 10 model
-  outputs referenced by row index, without review text, hotel or reviewer data. The
-  error analysis quotes short snippets for illustration.
+  `e4404ae54c02c1a53b9b3a5822b1fc2860a05fb1`, downloaded through the parquet API on
+  2026-09-23. 34,561 Spanish hotel reviews; 33,038 remain after removing empty and
+  duplicated texts.
+- The dataset is **not redistributed**: `data/` is git-ignored, including the raw model
+  answers (they quote the reviews). The committed `results/` files are aggregates;
+  `example_outputs.jsonl` holds ten pipeline rows referenced by row index, with quotes
+  cut to 80 characters and names replaced by placeholders.
 - Code: MIT licence, see [`LICENSE`](LICENSE).
-
-## Repository layout
-
-```
-src/review_llm_eval/
-  config.py       taxonomy, label sets, defaults, paths
-  fetch.py        download the parquet (Hugging Face API)
-  data.py         loading, de-duplication, stratified sampling, gold queue
-  sample.py       CLI: build data/sample.jsonl
-  schema.py       output contract (JSON Schema) + validation
-  prompt.py       system prompt, review formatting, retry message
-  client.py       Ollama /api/chat client (structured outputs)
-  classify.py     one review: call, validate, retry once, record
-  run.py          CLI: batch run with worker threads
-  metrics.py      confusion matrix, P/R/F1, macro-F1, Cohen's kappa, percentiles
-  analyze.py      CLI: reliability, proxy, agreement, diagnostics -> results/
-  experiments.py  CLI: stability and optional-field experiments
-  label.py        CLI: blind human labelling -> gold/gold.jsonl
-  evaluate.py     CLI: per-aspect P/R/F1 and sentiment accuracy vs gold
-tests/            offline pytest suite (mocked LLM, synthetic fixtures)
-results/          committed aggregate results (CSV / Markdown)
-gold/             human labels (empty until labelled)
-```
 
 ## About
 
-Rebuild on public data of a system I designed and ran in production at work
-(automotive sector, customer reviews). It contains no proprietary code, prompts or
-data. Built with AI-assisted development; design decisions, evaluation and review are
-mine.
+A rebuild on public data of a system I designed and run in production. It contains no
+code, prompts, data or figures from that system: the decisions table states its choices
+without numbers, and every number in this README was measured here. Built with
+AI-assisted development.

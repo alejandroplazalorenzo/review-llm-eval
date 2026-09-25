@@ -1,3 +1,0 @@
-model,n,valid_rate,valid_1st_attempt_rate,retried,recovered,failed,hit_token_limit,latency_mean_s,latency_p50_s,latency_p95_s,server_mean_s,output_tokens_mean,prompt_tokens_mean,reviews_per_min
-qwen2.5:7b-instruct,350,1.0000,1.0000,0,0,0,0,4.6547,4.4650,5.1680,4.6360,122.9886,547.8743,51.4870
-gemma3:4b,350,1.0000,1.0000,0,0,0,0,5.4956,5.4028,6.3194,5.4750,138.2857,541.3714,43.5053

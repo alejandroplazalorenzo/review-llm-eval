@@ -1,3 +1,0 @@
-model,would_return_non_null,would_return_false,reviews_without_return_cue,would_return_non_null_without_cue,complaint_non_null,complaint_looks_spanish,aspects_per_review,all_aspects_non_null
-qwen2.5:7b-instruct,0.8114,0.4571,259,0.7761,0.7343,0.4630,3.2257,0.0057
-gemma3:4b,0.9543,0.5829,259,0.9421,0.7200,0.0000,4.8943,0.0286
