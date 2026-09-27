@@ -7,7 +7,7 @@ Usage::
     python -m review_llm_eval.alerts_review --reviewer <your name>   # read and answer
     python -m review_llm_eval.alerts_review --report                  # results/alert_calibration.md
 
-Verdicts go to ``gold/alert_verdicts.jsonl``. A model must not fill that file.
+Verdicts go to ``gold/alert_verdicts.jsonl`` (``--verdicts`` for another file).
 """
 
 from __future__ import annotations

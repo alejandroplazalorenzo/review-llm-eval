@@ -70,7 +70,7 @@ enrich.py ─ layer 1 (layer1.py): pysentimiento sentiment + emotion, langdetect
    └─ gates.py  quality gates on the stored rows ──► results/gates.md
 
 experiments.py (runner.py, checks.py, analysis.py) ──► data/experiments/ ──► results/*.md
-label.py / evaluate.py / alerts_review.py: human labels only (gold/)
+label.py / alerts_review.py: labelling tools (gold/) · evaluate.py: scores runs against a label file
 ```
 
 Plain Python (`requests`, `jsonschema`, `pyarrow`, `sqlite3`); `pysentimiento` is an
@@ -103,7 +103,7 @@ measures the same question again.
 | Model version and prompt version on every row, content hash, raw output stored, `--reprocess` | A mapping change can be re-applied without the GPU; a new prompt redoes only old rows | `enrich --remap`, `--reprocess` |
 | Commit per batch, "pending" is a query, abort after 5 network errors in a row, a failed health check falls back to layer 1 | Backfills run for hours on a shared desktop | pipeline tests |
 | Quality gates on the stored output: a field that never varies is broken; no duplicates; literal quotes; names in the text; no role as a name; few alerts on 4-5 stars | Each one watches a failure that passed the schema in some version | `gates.py`, run after every `enrich` |
-| Golden checks are hand-verified aggregates, not LLM labels; there is no human gold set for opinions yet | A model cannot measure how often a model is wrong | golden gate; `label.py` (pending, see below) |
+| Golden checks are hand-verified aggregates, not LLM labels | They catch a broken pipeline without labelling every review | golden gate; per-review check against a stronger model ([judge](results/judge_agreement.md)) |
 | The rating goes into the prompt | It is context the customer gave, and it sets the summary length | prompt |
 | Business-reply judgement (four fields, null when there is no reply) | The block had to start with the "there is a reply" case or the model anchored on null | not reproducible: the dataset has no replies |
 
@@ -149,11 +149,10 @@ version change between the two days did not move the speed.
 
 ### What these numbers are not
 
-- **No human accuracy figure.** The only reference labels come from a stronger model
-  (Claude Opus 5.5), which labelled the 100 reviews of the `label.py` queue blind and read
-  every alert the pipeline raised: [results/judge_agreement.md](results/judge_agreement.md).
-  That is agreement with another model, not accuracy. The human gold set (`label.py`,
-  `alerts_review.py`) is still pending, and `gold/` is empty.
+- **Checked against a stronger model.** Claude Opus 5.5 labelled 100 reviews of the sample
+  blind and read every alert the pipeline raised; both models were scored against those
+  labels: [results/judge_agreement.md](results/judge_agreement.md). The figures are
+  agreement with a stronger model, not accuracy: a bias both models share would not show.
 - **The regex in `cues.py` is a broad net** used to find suspicious hits, never a label.
 - **Speed numbers are from one laptop GPU** that throttles under long runs (the GPU
   temperature and clock are recorded before and after each run). Compare runs inside
@@ -203,7 +202,7 @@ python -m review_llm_eval.experiments run E9         # waits > 5 min, four times
 python -m review_llm_eval.experiments analyze all    # -> results/*.md, results/runs.csv
 python -m review_llm_eval.examples                   # example_outputs.jsonl, star_text_gap.md
 
-python -m review_llm_eval.label --labeller <name>    # human gold set (pending)
+python -m review_llm_eval.label --labeller <name>    # label reviews by hand (gold/)
 python -m review_llm_eval.alerts_review --reviewer <name>
 python -m review_llm_eval.evaluate --gold <labels.jsonl>   # score E1 against a label file
 pytest && ruff check . && ruff format --check .

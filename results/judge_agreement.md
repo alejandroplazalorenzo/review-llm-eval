@@ -1,14 +1,15 @@
-# Agreement with a stronger model (not a human gold set)
+# Agreement with a stronger model
 
-**Reference labels.** The 100 reviews of the `label.py` queue (main sample, 20 per star
-rating, seed 42), labelled blind by Claude Opus 5.5 (Anthropic) on 25 Sep 2026. It saw only
-the title and the text (no rating, hotel or model output) and followed the definitions of
-`label.py` and the prompt. The same model read the 100 alerts that qwen3:4b raised in the
-pipeline store and had to copy the literal phrase stating each one.
+**Reference labels.** To check the outputs, 100 reviews of the main sample (20 per star
+rating, seed 42) were labelled blind by a stronger model, Claude Opus 5.5 (Anthropic), on
+25 Sep 2026. It saw only the title and the text (no rating, hotel or model output) and
+followed the definitions of `label.py` and the prompt. The same model read the 100 alerts
+that qwen3:4b raised in the pipeline store and had to copy the literal phrase stating each
+one.
 
-**What this is not.** Agreement with another model, not accuracy: a bias both models share
-does not show here. The human gold set (`label.py`) is still pending. The labels stay local
-(`data/judge/`, git-ignored) because they contain staff names and quotes from the reviews.
+**How to read it.** These are agreement figures with a stronger model, not accuracy: a bias
+both models share would not show here. The labels stay local (`data/judge/`, git-ignored)
+because they contain staff names and quotes from the reviews.
 
 Commands:
 

@@ -1,9 +1,11 @@
-"""Score model outputs (and layer 1) against the human labels in ``gold/gold.jsonl``.
+"""Score model outputs (and layer 1) against a label file: ``gold/gold.jsonl`` by default,
+or any other file with ``--gold`` (e.g. a stronger model's labels, see
+``results/judge_agreement.md``).
 
-Usage: python -m review_llm_eval.evaluate [--runs e1_4b e1_8b]
+Usage: python -m review_llm_eval.evaluate [--gold labels.jsonl] [--runs e1_4b e1_8b]
 
-This is the only place where precision, recall or accuracy mean agreement with a human.
-If the gold file does not exist yet it says so and writes nothing.
+The figures are agreement with whoever produced the labels. If the label file does not
+exist it says so and writes nothing.
 """
 
 from __future__ import annotations
@@ -165,7 +167,7 @@ def main(argv: Sequence[str] | None = None) -> None:
     print(markdown_table(headers, rows))
     print()
     print(markdown_table(["run", "alert", "gold", "P", "R"], alert_rows))
-    print(f"\nlayer 1 sentiment accuracy vs human: {acc1:.3f} on {n1} reviews")
+    print(f"\nlayer 1 sentiment accuracy vs the labels: {acc1:.3f} on {n1} reviews")
 
 
 if __name__ == "__main__":

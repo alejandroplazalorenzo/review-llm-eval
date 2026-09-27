@@ -4,7 +4,6 @@ Usage: python -m review_llm_eval.label --labeller <your name>
 
 The labeller never sees the star rating, the hotel or any model output (blind
 labelling). Progress is saved after every review; run the command again to continue.
-Labels must come from a person: a model cannot tell how often a model is wrong.
 """
 
 from __future__ import annotations
