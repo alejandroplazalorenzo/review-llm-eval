@@ -103,14 +103,14 @@ def test_main_runs_layer1_skips_llm_when_ollama_is_down_and_writes_gates(
 
 def test_gates_catch_broken_output(tmp_path: Path, reviews: list[Review]) -> None:
     conn = ready_store(tmp_path, reviews)
-    enrich.enrich_llm(conn, FakeClient([make_output()]), MODEL, store.ALL)
+    enrich.enrich_llm(conn, FakeClient([make_output(rob=True)]), MODEL, store.ALL)
     version = enrich.full_version(MODEL)
     report = gates.run_gates(conn, version)
     names = {g.name: g for g in report.gates}
     assert names["no duplicated opinions"].ok
     assert names["every staff name is in its review"].ok
-    # the fake answers says_no_return=true everywhere: on 4-5 star reviews that is an
-    # inferred alert, and no text supports it
+    # the fake answers theft=true everywhere (a flag rules.py does not touch): on 4-5 star
+    # reviews that is an inferred alert, and no text supports it
     assert not names["alerts on 4-5 star reviews backed by a phrase"].ok
     # break the stored data the way a regression would
     conn.execute('UPDATE review_enrichment SET staff = \'["camarero", "nadie aqui"]\'')

@@ -15,6 +15,8 @@ Behaviour carried over from production:
   (it is retried by the next run); transport errors are counted apart and the run stops
   after ``MAX_CONSECUTIVE_NETWORK_ERRORS`` in a row;
 - if Ollama does not answer the health check, the run goes on with layer 1 only;
+- after the model, ``rules.py`` drops the explicit-only flags ("says no return",
+  "explicitly recommends") that no phrase in the review can support;
 - every row carries ``<layer1>+<model>/<prompt>``; ``--reprocess`` redoes rows enriched
   with any other version;
 - the quality gates run at the end of every run (``gates.py``) and are written to
@@ -33,7 +35,7 @@ from collections.abc import Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from review_llm_eval import gates, layer1, store
+from review_llm_eval import gates, layer1, rules, store
 from review_llm_eval.client import LLMClient, OllamaClient, healthcheck
 from review_llm_eval.config import (
     BATCH_SIZE,
@@ -128,8 +130,9 @@ def enrich_llm(
             stats.failed_invalid += 1
             stats.warnings.append(f"review {review.review_id}: {extraction.warning}")
             return True  # left pending: the next run retries it
-        expanded = expand(
-            extraction.output, BASE, review.full_text, veto_for(review.hotel, base_veto)
+        expanded = rules.apply(
+            expand(extraction.output, BASE, review.full_text, veto_for(review.hotel, base_veto)),
+            review.full_text,
         )
         staff = [normalize_name(n) for n in expanded["staff"]]
         store.write_llm(conn, review.review_id, expanded, staff, len(extraction.attempts), version)
@@ -167,8 +170,14 @@ def remap(conn: sqlite3.Connection, model: str, scope: store.Scope = store.ALL) 
     base_veto = hotel_veto(store.hotel_names(conn))
     for row in rows:
         review = _review_from_row(row)
-        expanded = expand(
-            json.loads(row["raw_output"]), BASE, review.full_text, veto_for(review.hotel, base_veto)
+        expanded = rules.apply(
+            expand(
+                json.loads(row["raw_output"]),
+                BASE,
+                review.full_text,
+                veto_for(review.hotel, base_veto),
+            ),
+            review.full_text,
         )
         staff = [normalize_name(n) for n in expanded["staff"]]
         store.write_llm(conn, review.review_id, expanded, staff, row["llm_attempts"], version)

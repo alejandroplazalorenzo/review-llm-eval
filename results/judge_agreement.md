@@ -68,5 +68,8 @@ model; 11 of the confirmed alerts rest on the title alone.
 - **"Explicitly recommends" is over-flagged the same way.** The prompt says that speaking well
   is not enough; the 4b still marks 36 reviews, and the reference finds an explicit
   recommendation in 6.
+- **Both are fixed after the model by a rule in code:** see [explicit_rule.md](explicit_rule.md)
+  (no-return precision 0.36 → 0.92, "recommends" 36 → 7 flagged with all 6 found). The
+  figures above are the model's own answers, before that rule.
 - **Incidents behave as designed:** few false positives (3 of 31 with the 4b), some misses
   (10 of 38).

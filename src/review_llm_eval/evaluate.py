@@ -17,6 +17,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+from review_llm_eval import rules
 from review_llm_eval.config import (
     EXPERIMENTS_DIR,
     GOLD_PATH,
@@ -123,6 +124,9 @@ def main(argv: Sequence[str] | None = None) -> None:
     parser.add_argument("--store", type=Path, default=STORE_PATH)
     parser.add_argument("--results", type=Path, default=RESULTS_DIR)
     parser.add_argument("--min-labels", type=int, default=GOLD_TARGET)
+    parser.add_argument(
+        "--rules", action="store_true", help="apply the explicit-only rule (rules.py) first"
+    )
     args = parser.parse_args(argv)
 
     gold = load_gold(args.gold)
@@ -146,9 +150,10 @@ def main(argv: Sequence[str] | None = None) -> None:
             out = (rec.get("extraction") or {}).get("output")
             rv = reviews.get(rec["review_id"])
             if out is not None and rv is not None:
-                outputs[rec["review_id"]] = expand(
-                    out, BASE, rv.full_text, veto_for(rv.hotel, base)
-                )
+                expanded = expand(out, BASE, rv.full_text, veto_for(rv.hotel, base))
+                if args.rules:
+                    expanded = rules.apply(expanded, rv.full_text)
+                outputs[rec["review_id"]] = expanded
         ev = evaluate_outputs(gold, outputs)
         rows.append(
             [

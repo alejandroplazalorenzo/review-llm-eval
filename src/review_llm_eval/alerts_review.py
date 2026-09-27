@@ -113,16 +113,17 @@ def main(argv: Sequence[str] | None = None) -> None:
     if args.reviewer:
         review_loop(hits, args.verdicts, args.reviewer)
     table = markdown_table(
-        ["alert", "raised", "read by a person", "correct"],
+        ["alert", "raised", "read", "correct"],
         summarize(hits, load_verdicts(args.verdicts)),
     )
     print(table)
     if args.report:
         args.results.mkdir(parents=True, exist_ok=True)
         (args.results / "alert_calibration.md").write_text(
-            "# Alert calibration (human reading)\n\n"
+            "# Alert calibration\n\n"
             f"Alerts raised by `{full_version(args.model)}` in the pipeline store, read one by "
-            "one by a person. Reported as 'at least N correct', not as a rate.\n\n"
+            f"one (verdicts: `{args.verdicts}`). Reported as 'at least N correct', not as a "
+            "rate.\n\n"
             f"{table}\n",
             encoding="utf-8",
         )
